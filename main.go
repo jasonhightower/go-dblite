@@ -1,6 +1,7 @@
 package main
 
 import (
+    "io"
 	"bufio"
 	"encoding/binary"
 	"fmt"
@@ -14,6 +15,10 @@ const (
     STATEMENT_SELECT = 2
     COLUMN_USERNAME_SIZE = 32
     COLUMN_EMAIL_SIZE = 255
+
+    META_STATE_EXIT = 1
+    META_STATE_ERROR = -1
+    META_STATE_SUCCESS = 0
 
     ID_SIZE = 4
     ROW_SIZE = ID_SIZE + COLUMN_USERNAME_SIZE + COLUMN_EMAIL_SIZE
@@ -38,8 +43,24 @@ type Row struct {
     Username [COLUMN_USERNAME_SIZE]byte
     Email [COLUMN_EMAIL_SIZE]byte
 }
+func strLen(in []byte) int {
+    from, to := 0, len(in)
+    for from < to {
+        index := (from + to) / 2
+        if in[index] == 0 {
+            to = index
+        } else {
+            from = index + 1
+        }
+    }
+    return from
+}
+
 func (r *Row) String() string {
-    return fmt.Sprintf(" %d | %s | %s \n", r.Id, r.Username, r.Email)  
+    emailLen := strLen(r.Email[:])
+    userLen := strLen(r.Username[:])
+    // should be a better way to do this
+    return fmt.Sprintf(" %d | %s | %s", r.Id, string(r.Username[:userLen]), string(r.Email[:emailLen]))  
 }
 
 func NewRow(id uint32, username string, email string) (*Row) {
@@ -75,12 +96,10 @@ func (t *Table) rowLocation(id uint32, alloc bool) (*[PAGE_SIZE]byte, uint, erro
     return page, uint(pageOffset), nil
 }
 func (t *Table) Insert(row *Row) (error) {
-    if t.RowCount == TABLE_MAX_ROWS {
-        return fmt.Errorf("Table full")
+    if t.RowCount >= uint32(TABLE_MAX_ROWS) {
+        return fmt.Errorf("Table full.")
     }
-    row.Id = t.RowCount
     if page, offset, err := t.rowLocation(t.RowCount, true); err == nil {
-        fmt.Printf("Writing into %d of a %d sized array - %s\n", offset, len(*page), page)
         binary.BigEndian.PutUint32((*page)[offset:], row.Id)
         copy(page[offset + ID_SIZE:], row.Email[:])
         copy(page[offset + ID_SIZE + COLUMN_EMAIL_SIZE:], row.Username[:])
@@ -116,8 +135,9 @@ func NewStatement(statementType int, row *Row) (*Statement) {
 }
 
 
-func show_prompt() {
-   fmt.Print("dblite > ") 
+func show_prompt(out *bufio.Writer) {
+   out.WriteString("dblite > ") 
+   out.Flush()
 }
 
 func read_input(reader *bufio.Reader) string {
@@ -125,11 +145,11 @@ func read_input(reader *bufio.Reader) string {
     return strings.TrimSpace(text)
 }
 
-func executeMetaCommand(instruction string) (error) {
+func executeMetaCommand(instruction string, out *bufio.Writer) (int, error) {
     if instruction == ".exit" {
-        os.Exit(0)
+        return META_STATE_EXIT, nil
     }
-    return fmt.Errorf("Unrecognized command '%s'", instruction)
+    return META_STATE_ERROR, fmt.Errorf("Unrecognized command '%s'", instruction)
 }
 
 func parseStatement(instruction string) (*Statement, error) {
@@ -141,9 +161,17 @@ func parseStatement(instruction string) (*Statement, error) {
         if len(args) != 3 {
             return nil, fmt.Errorf("Insert syntax error: got %d arguments expected 3", len(args))
         }
+        if len(args[1]) > COLUMN_USERNAME_SIZE {
+            return nil, fmt.Errorf("username is too long")
+        }
+        if len(args[2]) > COLUMN_EMAIL_SIZE {
+            return nil, fmt.Errorf("email is too long");
+        }
         id, err := strconv.Atoi(args[0])
         if err != nil {
             return nil, fmt.Errorf("Insert syntax error: %s", err.Error())
+        } else if id < 0 {
+            return nil, fmt.Errorf("ID must be positive.")
         }
         row := NewRow(uint32(id), args[1], args[2])
         return NewStatement(STATEMENT_INSERT, row), nil
@@ -154,39 +182,60 @@ func parseStatement(instruction string) (*Statement, error) {
     return nil, fmt.Errorf("Unrecognized statement '%s'", instruction)
 }
 
-func main() {
+func exec(in *io.Reader, out *io.Writer) {
+    bufIn := bufio.NewReader(*in)
+    bufOut := bufio.NewWriter(*out)
     table := Table{}
-    input_reader := bufio.NewReader(os.Stdin)
     for true {
-        show_prompt()
-        instruction := read_input(input_reader)
+        show_prompt(bufOut)
+        instruction := read_input(bufIn)
         if instruction[0] == '.' {
-            if err := executeMetaCommand(instruction); err != nil {
-                fmt.Println(err.Error())
+            if state, err := executeMetaCommand(instruction, bufOut); state == META_STATE_ERROR {
+                bufOut.WriteString(err.Error())
+                bufOut.WriteString("\n")
                 continue
+            } else if state == META_STATE_EXIT {
+                bufOut.WriteString("Exiting.\n")
+                bufOut.Flush()
+                return
             }
         } else {
             statement, err := parseStatement(instruction)
             if err != nil {
-                fmt.Println(err.Error())
+                bufOut.WriteString(err.Error())
+                bufOut.WriteString("\n")
                 continue
             }
             switch statement.StatementType {
             case STATEMENT_INSERT: 
-                 fmt.Println("Executing insert")
-                 table.Insert(statement.InsertRow)                 
+                 bufOut.WriteString("Executing\n")
+                 err := table.Insert(statement.InsertRow)                 
+                 if err != nil {
+                    bufOut.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
+                    bufOut.Flush()
+                    continue
+                 }
             case STATEMENT_SELECT:
-                 fmt.Println("Executing select")
-                for i := uint32(0); i < table.RowCount; i++ {
+                 bufOut.WriteString("Executing\n")
+                 for i := uint32(0); i < table.RowCount; i++ {
                     row, err := table.Read(i)
                     if err != nil {
-                        fmt.Printf("Error executing select: %s\n", err.Error())
+                        bufOut.WriteString("Error executing select: ")
+                        bufOut.WriteString(err.Error())
+                        bufOut.WriteString("\n")
                         continue
                     }
-                    fmt.Println(row)
+                    bufOut.WriteString(row.String())
+                    bufOut.WriteString("\n")
                 }
             default:
             }
         }
     }
+}
+
+func main() {
+    var out io.Writer = os.Stdout
+    var in io.Reader = os.Stdin
+    exec(&in, &out)
 }
