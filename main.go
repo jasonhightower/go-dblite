@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+    "flag"
 )
 
 const (
@@ -28,21 +29,6 @@ const (
     TABLE_MAX_ROWS = TABLE_MAX_PAGES * ROWS_PER_PAGE
 )
 
-func resizeString(str string, size int) string {
-    if len(str) == size {
-        return str
-    }
-    if len(str) > size {
-        return str[:size]
-    }
-    return fmt.Sprintf("%*s", size - len(str), str)
-}
-
-type Row struct {
-    Id uint32
-    Username [COLUMN_USERNAME_SIZE]byte
-    Email [COLUMN_EMAIL_SIZE]byte
-}
 func strLen(in []byte) int {
     from, to := 0, len(in)
     for from < to {
@@ -56,13 +42,11 @@ func strLen(in []byte) int {
     return from
 }
 
-func (r *Row) String() string {
-    emailLen := strLen(r.Email[:])
-    userLen := strLen(r.Username[:])
-    // should be a better way to do this
-    return fmt.Sprintf(" %d | %s | %s", r.Id, string(r.Username[:userLen]), string(r.Email[:emailLen]))  
+type Row struct {
+    Id uint32
+    Username [COLUMN_USERNAME_SIZE]byte
+    Email [COLUMN_EMAIL_SIZE]byte
 }
-
 func NewRow(id uint32, username string, email string) (*Row) {
     row := Row{
         Id: id,
@@ -71,25 +55,106 @@ func NewRow(id uint32, username string, email string) (*Row) {
     copy(row.Email[:], email)
     return &row
 }
-type Page struct {
-    Rows [PAGE_SIZE]byte
-}
-type Table struct {
-    RowCount uint32
-    Pages [TABLE_MAX_PAGES]*[PAGE_SIZE]byte // array of pointers to byte arrays for each page
+func (r *Row) String() string {
+    emailLen := strLen(r.Email[:])
+    userLen := strLen(r.Username[:])
+    // should be a better way to do this
+    return fmt.Sprintf(" %d | %s | %s", r.Id, string(r.Username[:userLen]), string(r.Email[:emailLen]))  
 }
 
-func (t *Table) rowLocation(id uint32, alloc bool) (*[PAGE_SIZE]byte, uint, error) {
-    pageIndex := id / ROWS_PER_PAGE
-    page := t.Pages[pageIndex]
-    if page == nil {
-        if alloc {
-            var newPage [PAGE_SIZE]byte
-            t.Pages[pageIndex] = &newPage
-            page = t.Pages[pageIndex]
-        } else {
-            return nil, 0, fmt.Errorf("Id %d not found", id)
+type Pager struct {
+    FileDescriptor *os.File
+    FileLength int64
+    Pages [TABLE_MAX_PAGES]*[PAGE_SIZE]byte
+}
+func NewPager(filePath string) (*Pager, error) {
+    if f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0755); err != nil {
+        return nil, err
+    } else {
+        pager := Pager{
+            FileDescriptor: f,
         }
+        if stat, err := f.Stat(); err != nil {
+            return nil, err
+        } else {
+            pager.FileLength = stat.Size()
+        }
+
+        return &pager, nil
+    }
+}
+func (p *Pager) Flush(pageNum int, size int) (error) {
+    if p.Pages[pageNum] == nil {
+        return fmt.Errorf("Attempted to flush nil page %d", pageNum)
+    }
+    _, err := p.FileDescriptor.WriteAt(p.Pages[pageNum][:size], int64(pageNum * PAGE_SIZE))
+    if err != nil {
+        return err
+    }
+    
+    return nil
+}
+func (p *Pager) GetPage(pageNum int) (*[PAGE_SIZE]byte, error) {
+    if pageNum > TABLE_MAX_PAGES {
+        return nil, fmt.Errorf("Page %d out of bounds %d", pageNum, TABLE_MAX_PAGES)
+    }
+    if p.Pages[pageNum] == nil {
+        // TODO JH consider doing something with the returned offset instead of _ 
+        if _, err := p.FileDescriptor.Seek(0, io.SeekStart); err != nil {
+            return nil, err
+        }
+        page := make([]byte, PAGE_SIZE)
+        p.FileDescriptor.Read(page)
+        p.Pages[pageNum] = (*[PAGE_SIZE]byte)(page)
+    }
+    return p.Pages[pageNum], nil
+}
+
+type Table struct {
+    RowCount uint32
+    Pager *Pager
+}
+func OpenDb(filePath string) (*Table, error) {
+    if pager, err := NewPager(filePath); err != nil {
+        return nil, err
+    } else {
+        numRows := uint32(pager.FileLength / ROW_SIZE)
+        table := Table{
+            Pager: pager,
+            RowCount: numRows,
+        }
+        return &table, nil
+    }
+}
+func (t *Table) Close() error {
+    pager := t.Pager
+    fullPages := int(t.RowCount / ROWS_PER_PAGE)
+
+    for i := 0; i < fullPages; i++ {
+        if pager.Pages[i] == nil {
+            continue
+        }
+        err := pager.Flush(i, PAGE_SIZE)
+        if err != nil {
+            return err
+        }
+    }
+    numAdditionalRows := t.RowCount % ROWS_PER_PAGE
+    if numAdditionalRows > 0 {
+        if pager.Pages[fullPages] != nil {
+            err := pager.Flush(fullPages, int(numAdditionalRows) * ROW_SIZE)
+            if err != nil {
+                return err
+            }
+        }    
+    }
+    return pager.FileDescriptor.Close()
+}
+func (t *Table) rowLocation(id int, alloc bool) (*[PAGE_SIZE]byte, uint, error) {
+    pageIndex := id / ROWS_PER_PAGE
+    page, err := t.Pager.GetPage(pageIndex)
+    if err != nil {
+        return nil, 0, err
     }
     rowInPage := id % ROWS_PER_PAGE
     pageOffset := rowInPage * ROW_SIZE
@@ -99,7 +164,7 @@ func (t *Table) Insert(row *Row) (error) {
     if t.RowCount >= uint32(TABLE_MAX_ROWS) {
         return fmt.Errorf("Table full.")
     }
-    if page, offset, err := t.rowLocation(t.RowCount, true); err == nil {
+    if page, offset, err := t.rowLocation(int(t.RowCount), true); err == nil {
         binary.BigEndian.PutUint32((*page)[offset:], row.Id)
         copy(page[offset + ID_SIZE:], row.Email[:])
         copy(page[offset + ID_SIZE + COLUMN_EMAIL_SIZE:], row.Username[:])
@@ -112,7 +177,7 @@ func (t *Table) Insert(row *Row) (error) {
 }
 func (t *Table) Read(rowNum uint32) (*Row, error) {
     // TODO JH sanity check row index
-    if page, offset, err := t.rowLocation(uint32(rowNum), false); err != nil {
+    if page, offset, err := t.rowLocation(int(rowNum), false); err != nil {
         return nil, err
     } else {
         row := &Row{}
@@ -182,10 +247,15 @@ func parseStatement(instruction string) (*Statement, error) {
     return nil, fmt.Errorf("Unrecognized statement '%s'", instruction)
 }
 
-func exec(in *io.Reader, out *io.Writer) {
+func exec(dbFile string, in *io.Reader, out *io.Writer) {
     bufIn := bufio.NewReader(*in)
     bufOut := bufio.NewWriter(*out)
-    table := Table{}
+    // open table file
+    table, err := OpenDb(dbFile)
+    if err != nil {
+        fmt.Printf("Error opening db %s: %s", dbFile, err.Error())
+    }
+    defer table.Close()
     for true {
         show_prompt(bufOut)
         instruction := read_input(bufIn)
@@ -225,6 +295,9 @@ func exec(in *io.Reader, out *io.Writer) {
                         bufOut.WriteString("\n")
                         continue
                     }
+                    if row == nil {
+                        panic(fmt.Sprintf("Row at %d was nil", i))
+                    }
                     bufOut.WriteString(row.String())
                     bufOut.WriteString("\n")
                 }
@@ -237,5 +310,7 @@ func exec(in *io.Reader, out *io.Writer) {
 func main() {
     var out io.Writer = os.Stdout
     var in io.Reader = os.Stdin
-    exec(&in, &out)
+    dbFile := flag.String("dbfile", "dbfile.db", "Name of the database file")
+
+    exec(*dbFile, &in, &out)
 }
