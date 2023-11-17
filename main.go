@@ -110,6 +110,66 @@ func (p *Pager) GetPage(pageNum int) (*[PAGE_SIZE]byte, error) {
     return p.Pages[pageNum], nil
 }
 
+type Cursor struct {
+    Table *Table
+    RowNum uint32
+    EndOfTable bool
+}
+func NewCursor(table *Table) (*Cursor) {
+    return &Cursor{
+        Table: table,
+        RowNum: 0,
+        EndOfTable: table.RowCount == 0,
+    }
+}
+func (c *Cursor) Advance() {
+    c.RowNum += 1
+    if c.RowNum >= c.Table.RowCount {
+        c.EndOfTable = true
+    }
+}
+func (c *Cursor) MoveToEnd() {
+    c.RowNum = c.Table.RowCount
+    c.EndOfTable = true
+}
+func (c *Cursor)Row() (*[PAGE_SIZE]byte, uint, error) {
+    pageIndex := c.RowNum / ROWS_PER_PAGE
+    page, err := c.Table.Pager.GetPage(int(pageIndex))
+    if err != nil {
+        return nil, 0, err
+    }
+    rowInPage := c.RowNum % ROWS_PER_PAGE
+    pageOffset := rowInPage * ROW_SIZE
+    return page, uint(pageOffset), nil
+}
+func (c *Cursor) Write(row *Row) (error) {
+    if c.Table.RowCount >= uint32(TABLE_MAX_ROWS) {
+        return fmt.Errorf("Table full.")
+    }
+    if page, offset, err := c.Row(); err == nil {
+        binary.BigEndian.PutUint32((*page)[offset:], row.Id)
+        copy(page[offset + ID_SIZE:], row.Email[:])
+        copy(page[offset + ID_SIZE + COLUMN_EMAIL_SIZE:], row.Username[:])
+        c.Table.RowCount += 1
+        return nil
+    } else {
+        // TODO JH add a better error message
+        return err
+    }
+}
+func (c *Cursor) Read() (*Row, error) {
+    // TODO JH sanity check row index
+    if page, offset, err := c.Row(); err != nil {
+        return nil, err
+    } else {
+        row := &Row{}
+        row.Id = binary.BigEndian.Uint32(page[offset:])
+        copy(row.Email[:], page[offset + ID_SIZE:])
+        copy(row.Username[:], page[offset + ID_SIZE + COLUMN_EMAIL_SIZE:])
+        return row, nil
+    }
+}
+
 type Table struct {
     RowCount uint32
     Pager *Pager
@@ -149,43 +209,6 @@ func (t *Table) Close() error {
         }    
     }
     return pager.FileDescriptor.Close()
-}
-func (t *Table) rowLocation(id int, alloc bool) (*[PAGE_SIZE]byte, uint, error) {
-    pageIndex := id / ROWS_PER_PAGE
-    page, err := t.Pager.GetPage(pageIndex)
-    if err != nil {
-        return nil, 0, err
-    }
-    rowInPage := id % ROWS_PER_PAGE
-    pageOffset := rowInPage * ROW_SIZE
-    return page, uint(pageOffset), nil
-}
-func (t *Table) Insert(row *Row) (error) {
-    if t.RowCount >= uint32(TABLE_MAX_ROWS) {
-        return fmt.Errorf("Table full.")
-    }
-    if page, offset, err := t.rowLocation(int(t.RowCount), true); err == nil {
-        binary.BigEndian.PutUint32((*page)[offset:], row.Id)
-        copy(page[offset + ID_SIZE:], row.Email[:])
-        copy(page[offset + ID_SIZE + COLUMN_EMAIL_SIZE:], row.Username[:])
-        t.RowCount += 1
-        return nil
-    } else {
-        // TODO JH add a better error message
-        return err
-    }
-}
-func (t *Table) Read(rowNum uint32) (*Row, error) {
-    // TODO JH sanity check row index
-    if page, offset, err := t.rowLocation(int(rowNum), false); err != nil {
-        return nil, err
-    } else {
-        row := &Row{}
-        row.Id = binary.BigEndian.Uint32(page[offset:])
-        copy(row.Email[:], page[offset + ID_SIZE:])
-        copy(row.Username[:], page[offset + ID_SIZE + COLUMN_EMAIL_SIZE:])
-        return row, nil
-    }
 }
 
 type Statement struct {
@@ -279,7 +302,9 @@ func exec(dbFile string, in *io.Reader, out *io.Writer) {
             switch statement.StatementType {
             case STATEMENT_INSERT: 
                  bufOut.WriteString("Executing\n")
-                 err := table.Insert(statement.InsertRow)                 
+                 cursor := NewCursor(table)
+                 cursor.MoveToEnd()
+                 err := cursor.Write(statement.InsertRow)                 
                  if err != nil {
                     bufOut.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
                     bufOut.Flush()
@@ -287,8 +312,9 @@ func exec(dbFile string, in *io.Reader, out *io.Writer) {
                  }
             case STATEMENT_SELECT:
                  bufOut.WriteString("Executing\n")
-                 for i := uint32(0); i < table.RowCount; i++ {
-                    row, err := table.Read(i)
+                 cursor := NewCursor(table)
+                 for i := 0; cursor.EndOfTable == false; i++ {
+                    row, err := cursor.Read()
                     if err != nil {
                         bufOut.WriteString("Error executing select: ")
                         bufOut.WriteString(err.Error())
@@ -300,6 +326,7 @@ func exec(dbFile string, in *io.Reader, out *io.Writer) {
                     }
                     bufOut.WriteString(row.String())
                     bufOut.WriteString("\n")
+                    cursor.Advance()
                 }
             default:
             }
